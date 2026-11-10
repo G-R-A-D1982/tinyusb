@@ -90,6 +90,7 @@ static inline bool tuh_ready(uint8_t daddr)
 
 // Carry out control transfer
 bool tuh_control_xfer (uint8_t daddr, tusb_control_request_t const* request, void* buffer, tuh_control_complete_cb_t complete_cb);
+bool tuh_control_xfer_bypass(uint8_t daddr, tusb_control_request_t const* request, void* buffer, tuh_control_complete_cb_t complete_cb);
 
 // Set Configuration
 // config_num = 0 will un-configure device. Note: config_num = config_descriptor_index + 1

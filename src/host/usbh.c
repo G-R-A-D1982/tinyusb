@@ -541,7 +541,7 @@ static void handle_osal_queue() {
       if (cb_event.dev_addr == 0)
       {
         // device 0 only has control endpoint
-        TU_ASSERT(epnum == 0);
+        TU_ASSERT(epnum == 0, );
         usbh_control_xfer_cb(cb_event.dev_addr, cb_event.ep_addr, cb_event.result, cb_event.xferred_bytes);
         TU_LOG2("Cmd is on going %d (%d)\n", cmdIsOnGoing, __LINE__);
       }
@@ -585,7 +585,7 @@ static void handle_osal_queue() {
 
         cmdIsOnGoing = true;
         // Send setup packet
-        TU_ASSERT( hcd_setup_send(event.rhport, event.dev_addr, (uint8_t const*)event.request) );
+        TU_ASSERT( hcd_setup_send(event.rhport, event.dev_addr, (uint8_t const*)event.request), );
 
         if (event.event_cb) event.event_cb(&event, false);
         TU_LOG2("HCD_EVENT_CTRL_COMMAND done 0x%x\r\n", event.id);
@@ -599,7 +599,7 @@ static void handle_osal_queue() {
 
         cmdIsOnGoing = true;
 
-        TU_ASSERT(usbh_edpt_xfer(event.dev_addr, event.ep_addr, (uint8_t*) event.request, event.request_size));
+        TU_ASSERT(usbh_edpt_xfer(event.dev_addr, event.ep_addr, (uint8_t*) event.request, event.request_size), );
 
         if (event.event_cb) event.event_cb(&event, false);
         TU_LOG2("HCD_EVENT_HOST_COMMAND done 0x%x\r\n", event.id);

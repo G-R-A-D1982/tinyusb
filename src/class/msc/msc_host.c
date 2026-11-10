@@ -32,6 +32,7 @@
 #include "host/usbh_classdriver.h"
 
 #include "msc_host.h"
+#include <stdlib.h>
 
 //--------------------------------------------------------------------+
 // MACRO CONSTANT TYPEDEF

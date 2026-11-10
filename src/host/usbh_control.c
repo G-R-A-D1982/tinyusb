@@ -30,6 +30,7 @@
 
 #include "tusb.h"
 #include "usbh_classdriver.h"
+#include <stdlib.h>
 
 enum
 {
@@ -97,7 +98,7 @@ bool tuh_control_xfer_bypass (uint8_t dev_addr, tusb_control_request_t const* re
   _ctrl_xfer.complete_cb = complete_cb;
 
   // Send setup packet
-  TU_ASSERT( hcd_setup_send(rhport, dev_addr, request));
+  TU_ASSERT( hcd_setup_send(rhport, dev_addr, (uint8_t const*) request));
 
   TU_LOG2("HCD_EVENT_CTRL_BYPASS_COMMAND done\r\n");
 }
@@ -130,7 +131,7 @@ static void _xfer_complete(uint8_t dev_addr, xfer_result_t result)
   if (_ctrl_xfer.complete_cb) _ctrl_xfer.complete_cb(dev_addr, &_ctrl_xfer.request, result);
 }
 
-static void tuh_control_clear_feature(uint8_t dev_addr, uint8_t ep_addr, uint8_t feature) {
+static bool tuh_control_clear_feature(uint8_t dev_addr, uint8_t ep_addr, uint8_t feature) {
   TU_LOG3("tuh_control_clear_feature %x %x %x\n", dev_addr, ep_addr, feature);
   tusb_control_request_t const request =
   {
