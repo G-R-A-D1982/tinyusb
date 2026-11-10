@@ -42,13 +42,62 @@ enum
   MSC_STAGE_CMD,
   MSC_STAGE_DATA,
   MSC_STAGE_STATUS,
+  MSC_STAGE_UAS_COMMAND,
+  MSC_STAGE_UAS_READY,
+  MSC_STAGE_UAS_DATA,
+  MSC_STAGE_UAS_STATUS,
 };
+
+enum
+{
+  UAS_IU_COMMAND = 0x01,
+  UAS_IU_STATUS = 0x03,
+  UAS_IU_READ_READY = 0x06,
+  UAS_IU_WRITE_READY = 0x07,
+  UAS_PIPE_COMMAND = 1,
+  UAS_PIPE_STATUS = 2,
+  UAS_PIPE_DATA_IN = 3,
+  UAS_PIPE_DATA_OUT = 4,
+  UAS_PIPE_USAGE_DESCRIPTOR = 0x24,
+  UAS_STATUS_BUFFER_SIZE = 128,
+};
+
+typedef struct TU_ATTR_PACKED
+{
+  uint8_t iu_id;
+  uint8_t reserved1;
+  uint16_t tag;
+  uint8_t priority_attribute;
+  uint8_t reserved5;
+  uint8_t cdb_length;
+  uint8_t reserved7;
+  uint8_t lun[8];
+  uint8_t cdb[16];
+} uas_command_iu_t;
+
+typedef struct TU_ATTR_PACKED
+{
+  uas_command_iu_t command;
+  msc_cbw_t cbw;
+} uas_command_request_t;
 
 typedef struct
 {
   uint8_t itf_num;
   uint8_t ep_in;
   uint8_t ep_out;
+  uint8_t ep_command;
+  uint8_t ep_status;
+  uint8_t ep_data_in;
+  uint8_t ep_data_out;
+  uint8_t alternate_setting;
+  bool use_uas;
+  uint16_t uas_tag;
+  uint32_t uas_data_remaining;
+  uint32_t uas_data_offset;
+  uint32_t uas_ready_remaining;
+  uint16_t uas_chunk_length;
+  uint8_t uas_status[UAS_STATUS_BUFFER_SIZE];
 
   uint8_t max_lun;
 
@@ -67,6 +116,7 @@ typedef struct
   bool done;
   bool clear_done;
   uint retry;
+  void* request;
 
   msc_cbw_t cbw;
   msc_csw_t csw;
@@ -136,6 +186,21 @@ static bool setSync(uint8_t dev_addr, msc_cbw_t const* cbw, msc_csw_t const* csw
   return true;
 }
 
+static bool config_set_interface_complete(uint8_t dev_addr, tusb_control_request_t const * request, xfer_result_t result)
+{
+  (void)request;
+  msch_interface_t* p_msc = get_itf(dev_addr);
+  if (result == XFER_RESULT_SUCCESS) {
+    p_msc->max_lun = 1;
+    if (tuh_msc_enumerate_cb) tuh_msc_enumerate_cb(dev_addr);
+  } else {
+    p_msc->configured = false;
+    TU_LOG1("MSC UAS alternate setting failed\r\n");
+  }
+  usbh_driver_set_config_complete(dev_addr, p_msc->itf_num);
+  return true;
+}
+
 static bool tuh_msc_clear_feature(uint8_t dev_addr, uint8_t ep_addr, uint8_t feature, tuh_control_complete_cb_t complete_cb)
 {
   TU_LOG3("tuh_msc_clear_feature %x %x %x\n", dev_addr, ep_addr, feature);
@@ -164,17 +229,200 @@ static bool clear_feature_complete(uint8_t dev_addr, tusb_control_request_t cons
   return true;
 }
 
-static msc_cbw_t* nextToFree = NULL;
+static bool uas_finish_command(uint8_t dev_addr, msch_interface_t* p_msc, uint8_t status)
+{
+  p_msc->csw.signature = MSC_CSW_SIGNATURE;
+  p_msc->csw.tag = p_msc->cbw.tag;
+  p_msc->csw.data_residue = p_msc->uas_data_remaining;
+  p_msc->csw.status = status;
+  p_msc->stage = MSC_STAGE_IDLE;
+  usbh_can_accept_cmd();
+  if (p_msc->complete_cb) p_msc->complete_cb(dev_addr, &p_msc->cbw, &p_msc->csw);
+  return true;
+}
+
+static bool uas_read_status(uint8_t dev_addr, msch_interface_t* p_msc, uint8_t stage)
+{
+  memset(p_msc->uas_status, 0, sizeof(p_msc->uas_status));
+  p_msc->stage = stage;
+  if (!usbh_edpt_xfer(dev_addr, p_msc->ep_status, p_msc->uas_status, sizeof(p_msc->uas_status))) {
+    return uas_finish_command(dev_addr, p_msc, MSC_CSW_STATUS_CHECK_CONDITION);
+  }
+  return true;
+}
+
+static bool uas_start_data(uint8_t dev_addr, msch_interface_t* p_msc, bool input)
+{
+  bool const expected_input = (p_msc->cbw.dir & TUSB_DIR_IN_MASK) != 0;
+  if (!p_msc->cbw.total_bytes || !p_msc->buffer || input != expected_input ||
+      p_msc->uas_data_remaining == 0 || p_msc->uas_ready_remaining == 0 ||
+      p_msc->uas_data_offset > p_msc->cbw.total_bytes ||
+      p_msc->uas_ready_remaining > p_msc->cbw.total_bytes - p_msc->uas_data_offset) {
+    return uas_finish_command(dev_addr, p_msc, MSC_CSW_STATUS_CHECK_CONDITION);
+  }
+
+  uint32_t const chunk_length = TU_MIN(p_msc->uas_ready_remaining, UINT16_MAX);
+  uint8_t const ep_addr = input ? p_msc->ep_data_in : p_msc->ep_data_out;
+  p_msc->uas_chunk_length = (uint16_t)chunk_length;
+  p_msc->stage = MSC_STAGE_UAS_DATA;
+  if (!usbh_edpt_xfer(dev_addr, ep_addr,
+                      (uint8_t*)p_msc->buffer + p_msc->uas_data_offset,
+                      p_msc->uas_chunk_length)) {
+    return uas_finish_command(dev_addr, p_msc, MSC_CSW_STATUS_CHECK_CONDITION);
+  }
+  return true;
+}
+
+static bool uas_xfer_cb(uint8_t dev_addr, msch_interface_t* p_msc,
+                        uint8_t ep_addr, xfer_result_t event, uint32_t xferred_bytes)
+{
+  if (ep_addr == p_msc->ep_command) {
+    if (event != XFER_RESULT_SUCCESS || xferred_bytes != sizeof(uas_command_iu_t)) {
+      return uas_finish_command(dev_addr, p_msc, MSC_CSW_STATUS_CHECK_CONDITION);
+    }
+    if (p_msc->stage == MSC_STAGE_UAS_COMMAND) {
+      return uas_read_status(dev_addr, p_msc,
+                             p_msc->cbw.total_bytes ? MSC_STAGE_UAS_READY : MSC_STAGE_UAS_STATUS);
+    }
+    return true;
+  }
+
+  if (ep_addr != p_msc->ep_status && ep_addr != p_msc->ep_data_in &&
+      ep_addr != p_msc->ep_data_out) {
+    return uas_finish_command(dev_addr, p_msc, MSC_CSW_STATUS_CHECK_CONDITION);
+  }
+  if (event != XFER_RESULT_SUCCESS) {
+    return uas_finish_command(dev_addr, p_msc, MSC_CSW_STATUS_CHECK_CONDITION);
+  }
+
+  if (ep_addr == p_msc->ep_status &&
+      p_msc->stage != MSC_STAGE_UAS_READY && p_msc->stage != MSC_STAGE_UAS_STATUS) {
+    return uas_finish_command(dev_addr, p_msc, MSC_CSW_STATUS_CHECK_CONDITION);
+  }
+  if ((ep_addr == p_msc->ep_data_in || ep_addr == p_msc->ep_data_out) &&
+      p_msc->stage != MSC_STAGE_UAS_DATA) {
+    return uas_finish_command(dev_addr, p_msc, MSC_CSW_STATUS_CHECK_CONDITION);
+  }
+
+  switch (p_msc->stage) {
+    case MSC_STAGE_UAS_COMMAND:
+      return uas_finish_command(dev_addr, p_msc, MSC_CSW_STATUS_CHECK_CONDITION);
+
+    case MSC_STAGE_UAS_READY:
+      if (xferred_bytes < 4) {
+        return uas_finish_command(dev_addr, p_msc, MSC_CSW_STATUS_CHECK_CONDITION);
+      }
+      if (p_msc->uas_status[0] == UAS_IU_READ_READY) {
+        uint16_t tag;
+        memcpy(&tag, &p_msc->uas_status[2], sizeof(tag));
+        if (tu_ntohs(tag) != p_msc->uas_tag) {
+          return uas_finish_command(dev_addr, p_msc, MSC_CSW_STATUS_CHECK_CONDITION);
+        }
+        p_msc->uas_ready_remaining = p_msc->uas_data_remaining;
+        return uas_start_data(dev_addr, p_msc, true);
+      }
+      if (p_msc->uas_status[0] == UAS_IU_WRITE_READY) {
+        uint16_t tag;
+        memcpy(&tag, &p_msc->uas_status[2], sizeof(tag));
+        if (tu_ntohs(tag) != p_msc->uas_tag) {
+          return uas_finish_command(dev_addr, p_msc, MSC_CSW_STATUS_CHECK_CONDITION);
+        }
+        p_msc->uas_ready_remaining = p_msc->uas_data_remaining;
+        return uas_start_data(dev_addr, p_msc, false);
+      }
+      if (p_msc->uas_status[0] == UAS_IU_STATUS) {
+        uint16_t tag;
+        uint16_t sense_length;
+        memcpy(&tag, &p_msc->uas_status[2], sizeof(tag));
+        memcpy(&sense_length, &p_msc->uas_status[14], sizeof(sense_length));
+        if (xferred_bytes < 16 || tu_ntohs(tag) != p_msc->uas_tag ||
+            xferred_bytes < 16 + tu_ntohs(sense_length)) {
+          return uas_finish_command(dev_addr, p_msc, MSC_CSW_STATUS_CHECK_CONDITION);
+        }
+        return uas_finish_command(dev_addr, p_msc, p_msc->uas_status[6]);
+      }
+      return uas_finish_command(dev_addr, p_msc, MSC_CSW_STATUS_CHECK_CONDITION);
+
+    case MSC_STAGE_UAS_DATA:
+    {
+      if (xferred_bytes > p_msc->uas_chunk_length ||
+          xferred_bytes > p_msc->uas_data_remaining ||
+          xferred_bytes > p_msc->uas_ready_remaining) {
+        return uas_finish_command(dev_addr, p_msc, MSC_CSW_STATUS_CHECK_CONDITION);
+      }
+      p_msc->uas_data_offset += xferred_bytes;
+      p_msc->uas_data_remaining -= xferred_bytes;
+      p_msc->uas_ready_remaining -= xferred_bytes;
+      bool const short_transfer = xferred_bytes < p_msc->uas_chunk_length;
+      if (short_transfer) {
+        p_msc->uas_ready_remaining = 0;
+      }
+      if (!short_transfer && p_msc->uas_ready_remaining) {
+        return uas_start_data(dev_addr, p_msc,
+                              (p_msc->cbw.dir & TUSB_DIR_IN_MASK) != 0);
+      }
+      if (p_msc->uas_data_remaining && !short_transfer) {
+        return uas_read_status(dev_addr, p_msc, MSC_STAGE_UAS_READY);
+      }
+      return uas_read_status(dev_addr, p_msc, MSC_STAGE_UAS_STATUS);
+    }
+
+    case MSC_STAGE_UAS_STATUS:
+      {
+        uint16_t tag;
+        uint16_t sense_length;
+        memcpy(&tag, &p_msc->uas_status[2], sizeof(tag));
+        memcpy(&sense_length, &p_msc->uas_status[14], sizeof(sense_length));
+        if (xferred_bytes < 16 ||
+          p_msc->uas_status[0] != UAS_IU_STATUS ||
+          tu_ntohs(tag) != p_msc->uas_tag ||
+          xferred_bytes < 16 + tu_ntohs(sense_length)) {
+          return uas_finish_command(dev_addr, p_msc, MSC_CSW_STATUS_CHECK_CONDITION);
+        }
+        return uas_finish_command(dev_addr, p_msc, p_msc->uas_status[6]);
+      }
+
+    default:
+      return uas_finish_command(dev_addr, p_msc, MSC_CSW_STATUS_CHECK_CONDITION);
+  }
+}
+
 static void msch_event_start(hcd_event_t *event, bool start) {
   if (start) {
     msch_interface_t* p_msc = get_itf(event->dev_addr);
 
-    nextToFree = (msc_cbw_t*)event->request;
-    p_msc->cbw = *(nextToFree);
-    p_msc->stage = MSC_STAGE_CMD;
+    p_msc->request = event->request;
+    if (p_msc->use_uas) {
+      uas_command_request_t* request = (uas_command_request_t*)event->request;
+      p_msc->cbw = request->cbw;
+      p_msc->stage = MSC_STAGE_UAS_COMMAND;
+      p_msc->uas_tag++;
+      if (p_msc->uas_tag == 0 || p_msc->uas_tag == 0xFFFF) p_msc->uas_tag = 1;
+      memset(&request->command, 0, sizeof(request->command));
+      request->command.iu_id = UAS_IU_COMMAND;
+      request->command.tag = tu_htons(p_msc->uas_tag);
+      request->command.cdb_length = 0;
+      request->command.lun[1] = p_msc->cbw.lun;
+      memcpy(request->command.cdb, p_msc->cbw.command, sizeof(request->command.cdb));
+      p_msc->uas_data_remaining = p_msc->cbw.total_bytes;
+      p_msc->uas_data_offset = 0;
+      p_msc->uas_ready_remaining = 0;
+      p_msc->stage = p_msc->cbw.total_bytes ? MSC_STAGE_UAS_READY : MSC_STAGE_UAS_STATUS;
+    } else {
+      p_msc->cbw = *(msc_cbw_t*)event->request;
+      p_msc->stage = MSC_STAGE_CMD;
+    }
     p_msc->buffer = event->buffer;
     p_msc->retry = 4;
     p_msc->complete_cb = (tuh_msc_complete_cb_t)event->complete_cb;
+
+    if (p_msc->use_uas) {
+      memset(p_msc->uas_status, 0, sizeof(p_msc->uas_status));
+      if (!usbh_edpt_xfer(event->dev_addr, p_msc->ep_status, p_msc->uas_status,
+                          sizeof(p_msc->uas_status))) {
+        p_msc->stage = MSC_STAGE_UAS_COMMAND;
+      }
+    }
 
     TU_LOG2("Scsi Cmd: \n");
     TU_LOG2_MEM(p_msc->cbw.command, p_msc->cbw.cmd_len, 2);
@@ -186,18 +434,31 @@ static bool tuh_msc_command(uint8_t dev_addr, msc_cbw_t const* cbw, void* data, 
   msch_interface_t* p_msc = get_itf(dev_addr);
   TU_VERIFY(p_msc->configured);
 
-
-  msc_cbw_t *new_cbw = (msc_cbw_t *)malloc(sizeof(msc_cbw_t));
-  memcpy(new_cbw, cbw, sizeof(msc_cbw_t));
+  void* request;
+  uint16_t request_size;
+  if (p_msc->use_uas) {
+    uas_command_request_t* uas_request = (uas_command_request_t*)malloc(sizeof(uas_command_request_t));
+    TU_VERIFY(uas_request != NULL);
+    memset(uas_request, 0, sizeof(*uas_request));
+    uas_request->cbw = *cbw;
+    request = uas_request;
+    request_size = sizeof(uas_request->command);
+  } else {
+    msc_cbw_t* new_cbw = (msc_cbw_t*)malloc(sizeof(msc_cbw_t));
+    TU_VERIFY(new_cbw != NULL);
+    memcpy(new_cbw, cbw, sizeof(msc_cbw_t));
+    request = new_cbw;
+    request_size = sizeof(msc_cbw_t);
+  }
   hcd_event_t event =
   {
     .dev_addr = dev_addr,
-    .ep_addr  = p_msc->ep_out,
+    .ep_addr  = p_msc->use_uas ? p_msc->ep_command : p_msc->ep_out,
     .id = getCmdId(),
     .event_id = HCD_EVENT_HOST_COMMAND,
     .buffer   = data,
-    .request  = (void *)new_cbw,
-    .request_size = sizeof(msc_cbw_t),
+    .request  = request,
+    .request_size = request_size,
     .complete_cb = (void *)complete_cb,
     .event_cb = msch_event_start,
   };
@@ -348,7 +609,7 @@ bool tuh_msc_request_sense(uint8_t dev_addr, uint8_t lun, void *resposne, tuh_ms
 
   memcpy(&cbw.command[0], &cmd_request_sense, cbw.cmd_len);
   ret = tuh_msc_command(dev_addr, &cbw, resposne, complete_cb);
-  return true;
+  return ret;
 }
 
 bool tuh_msc_read10(uint8_t dev_addr, uint8_t lun, void * buffer, uint32_t lba, uint16_t block_count, tuh_msc_complete_cb_t complete_cb)
@@ -649,6 +910,7 @@ void msch_close(uint8_t dev_addr)
   // invoke Application Callback
   if (p_msc->mounted && tuh_msc_umount_cb) tuh_msc_umount_cb(dev_addr);
 
+  free(p_msc->request);
   tu_memclr(p_msc, sizeof(msch_interface_t));
 }
 
@@ -659,9 +921,13 @@ bool msch_xfer_cb(uint8_t dev_addr, uint8_t ep_addr, xfer_result_t event, uint32
   msc_csw_t       * csw = &p_msc->csw;
   bool finished = false;
 
-  if (nextToFree != NULL) {
-    free(nextToFree);
-    nextToFree = NULL;
+  if (p_msc->request != NULL && (!p_msc->use_uas || ep_addr == p_msc->ep_command)) {
+    free(p_msc->request);
+    p_msc->request = NULL;
+  }
+
+  if (p_msc->use_uas) {
+    return uas_xfer_cb(dev_addr, p_msc, ep_addr, event, xferred_bytes);
   }
 
   TU_LOG2("MSC Xfer stage %d %x %x Transfert:%x\n", p_msc->stage, cbw->total_bytes, p_msc->buffer, event);
@@ -759,36 +1025,105 @@ bool msch_xfer_cb(uint8_t dev_addr, uint8_t ep_addr, xfer_result_t event, uint32
 //--------------------------------------------------------------------+
 
 static bool config_get_maxlun_complete (uint8_t dev_addr, tusb_control_request_t const * request, xfer_result_t result);
+static bool config_set_interface_complete(uint8_t dev_addr, tusb_control_request_t const * request, xfer_result_t result);
 static bool config_test_unit_ready_complete(uint8_t dev_addr, msc_cbw_t const* cbw, msc_csw_t const* csw);
 static bool config_request_sense_complete(uint8_t dev_addr, msc_cbw_t const* cbw, msc_csw_t const* csw);
 static bool config_read_capacity_complete(uint8_t dev_addr, msc_cbw_t const* cbw, msc_csw_t const* csw);
 
 bool msch_open(uint8_t rhport, uint8_t dev_addr, tusb_desc_interface_t const *desc_itf, uint16_t max_len)
 {
-  TU_VERIFY (MSC_SUBCLASS_SCSI == desc_itf->bInterfaceSubClass &&
-             MSC_PROTOCOL_BOT  == desc_itf->bInterfaceProtocol);
+  typedef struct {
+    tusb_desc_endpoint_t const* command;
+    tusb_desc_endpoint_t const* status;
+    tusb_desc_endpoint_t const* data_in;
+    tusb_desc_endpoint_t const* data_out;
+    uint8_t alternate_setting;
+  } uas_endpoints_t;
 
-  // msc driver length is fixed
-  uint16_t const drv_len = sizeof(tusb_desc_interface_t) + desc_itf->bNumEndpoints*sizeof(tusb_desc_endpoint_t);
-  TU_ASSERT(drv_len <= max_len);
+  tusb_desc_endpoint_t const* bot_in = NULL;
+  tusb_desc_endpoint_t const* bot_out = NULL;
+  uas_endpoints_t uas = {0};
+  bool bot_candidate = false;
+  bool uas_candidate = false;
+  uint8_t current_protocol = 0;
+  uint8_t current_alternate = 0;
+  uint8_t const* const desc_end = (uint8_t const*)desc_itf + max_len;
 
-  msch_interface_t* p_msc = get_itf(dev_addr);
-  tusb_desc_endpoint_t const * ep_desc = (tusb_desc_endpoint_t const *) tu_desc_next(desc_itf);
+  for (uint8_t const* p_desc = (uint8_t const*)desc_itf; p_desc < desc_end; p_desc = tu_desc_next(p_desc)) {
+    uint8_t const desc_type = tu_desc_type(p_desc);
+    if (desc_type == TUSB_DESC_INTERFACE) {
+      tusb_desc_interface_t const* interface = (tusb_desc_interface_t const*)p_desc;
+      if (p_desc != (uint8_t const*)desc_itf && interface->bAlternateSetting == 0) break;
+      if (interface->bInterfaceNumber != desc_itf->bInterfaceNumber ||
+          interface->bInterfaceClass != TUSB_CLASS_MSC ||
+          interface->bInterfaceSubClass != MSC_SUBCLASS_SCSI) {
+        current_protocol = 0;
+        continue;
+      }
 
-  for(uint32_t i=0; i<2; i++)
-  {
-    TU_ASSERT(TUSB_DESC_ENDPOINT == ep_desc->bDescriptorType && TUSB_XFER_BULK == ep_desc->bmAttributes.xfer);
-    TU_ASSERT(usbh_edpt_open(rhport, dev_addr, ep_desc));
-
-    if ( tu_edpt_dir(ep_desc->bEndpointAddress) == TUSB_DIR_IN )
-    {
-      p_msc->ep_in = ep_desc->bEndpointAddress;
-    }else
-    {
-      p_msc->ep_out = ep_desc->bEndpointAddress;
+      current_protocol = interface->bInterfaceProtocol;
+      current_alternate = interface->bAlternateSetting;
+      if (current_protocol == MSC_PROTOCOL_BOT && current_alternate == 0) {
+        bot_candidate = true;
+      } else if (current_protocol == MSC_PROTOCOL_UAS) {
+        tu_memclr(&uas, sizeof(uas));
+        uas.alternate_setting = current_alternate;
+        uas_candidate = true;
+      }
+      continue;
     }
 
-    ep_desc = (tusb_desc_endpoint_t const *) tu_desc_next(ep_desc);
+    if (desc_type != TUSB_DESC_ENDPOINT || current_protocol == 0) continue;
+    tusb_desc_endpoint_t const* endpoint = (tusb_desc_endpoint_t const*)p_desc;
+    if (endpoint->bmAttributes.xfer != TUSB_XFER_BULK) continue;
+
+    if (current_protocol == MSC_PROTOCOL_BOT && current_alternate == 0) {
+      if (tu_edpt_dir(endpoint->bEndpointAddress) == TUSB_DIR_IN) bot_in = endpoint;
+      else bot_out = endpoint;
+      continue;
+    }
+
+    uint8_t const* const usage = tu_desc_next(p_desc);
+    if (usage >= desc_end || tu_desc_type(usage) != UAS_PIPE_USAGE_DESCRIPTOR ||
+        tu_desc_len(usage) < 4) {
+      continue;
+    }
+
+    switch (usage[2]) {
+      case UAS_PIPE_COMMAND: uas.command = endpoint; break;
+      case UAS_PIPE_STATUS: uas.status = endpoint; break;
+      case UAS_PIPE_DATA_IN: uas.data_in = endpoint; break;
+      case UAS_PIPE_DATA_OUT: uas.data_out = endpoint; break;
+      default: break;
+    }
+  }
+
+  bool const uas_complete = uas_candidate && uas.command && uas.status && uas.data_in && uas.data_out &&
+      tu_edpt_dir(uas.command->bEndpointAddress) == TUSB_DIR_OUT &&
+      tu_edpt_dir(uas.status->bEndpointAddress) == TUSB_DIR_IN &&
+      tu_edpt_dir(uas.data_in->bEndpointAddress) == TUSB_DIR_IN &&
+      tu_edpt_dir(uas.data_out->bEndpointAddress) == TUSB_DIR_OUT;
+  TU_VERIFY(uas_complete || (bot_candidate && bot_in && bot_out));
+
+  msch_interface_t* p_msc = get_itf(dev_addr);
+  if (uas_complete) {
+    TU_ASSERT(usbh_edpt_open(rhport, dev_addr, uas.command));
+    TU_ASSERT(usbh_edpt_open(rhport, dev_addr, uas.status));
+    TU_ASSERT(usbh_edpt_open(rhport, dev_addr, uas.data_in));
+    TU_ASSERT(usbh_edpt_open(rhport, dev_addr, uas.data_out));
+    p_msc->use_uas = true;
+    p_msc->alternate_setting = uas.alternate_setting;
+    p_msc->ep_command = uas.command->bEndpointAddress;
+    p_msc->ep_status = uas.status->bEndpointAddress;
+    p_msc->ep_data_in = uas.data_in->bEndpointAddress;
+    p_msc->ep_data_out = uas.data_out->bEndpointAddress;
+    p_msc->ep_in = p_msc->ep_status;
+    p_msc->ep_out = p_msc->ep_command;
+  } else {
+    TU_ASSERT(usbh_edpt_open(rhport, dev_addr, bot_in));
+    TU_ASSERT(usbh_edpt_open(rhport, dev_addr, bot_out));
+    p_msc->ep_in = bot_in->bEndpointAddress;
+    p_msc->ep_out = bot_out->bEndpointAddress;
   }
 
   p_msc->itf_num = desc_itf->bInterfaceNumber;
@@ -802,6 +1137,30 @@ bool msch_set_config(uint8_t dev_addr, uint8_t itf_num)
   TU_ASSERT(p_msc->itf_num == itf_num);
 
   p_msc->configured = true;
+
+  if (p_msc->use_uas) {
+    if (p_msc->alternate_setting != 0) {
+      tusb_control_request_t request =
+      {
+        .bmRequestType_bit =
+        {
+          .recipient = TUSB_REQ_RCPT_INTERFACE,
+          .type      = TUSB_REQ_TYPE_STANDARD,
+          .direction = TUSB_DIR_OUT
+        },
+        .bRequest = TUSB_REQ_SET_INTERFACE,
+        .wValue   = p_msc->alternate_setting,
+        .wIndex   = itf_num,
+        .wLength  = 0
+      };
+      TU_ASSERT(tuh_control_xfer(dev_addr, &request, NULL, config_set_interface_complete));
+    } else {
+      p_msc->max_lun = 1;
+      if (tuh_msc_enumerate_cb) tuh_msc_enumerate_cb(dev_addr);
+      usbh_driver_set_config_complete(dev_addr, p_msc->itf_num);
+    }
+    return true;
+  }
 
   //------------- Get Max Lun -------------//
   TU_LOG1("MSC Get Max Lun %d\r\n", itf_num);

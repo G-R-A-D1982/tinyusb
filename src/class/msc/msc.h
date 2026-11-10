@@ -58,7 +58,8 @@ typedef enum
 {
   MSC_PROTOCOL_CBI              = 0 ,  ///< Control/Bulk/Interrupt protocol (with command completion interrupt)
   MSC_PROTOCOL_CBI_NO_INTERRUPT = 1 ,  ///< Control/Bulk/Interrupt protocol (without command completion interrupt)
-  MSC_PROTOCOL_BOT              = 0x50 ///< Bulk-Only Transport
+  MSC_PROTOCOL_BOT              = 0x50, ///< Bulk-Only Transport
+  MSC_PROTOCOL_UAS              = 0x62  ///< USB Attached SCSI
 }msc_protocol_type_t;
 
 /// MassStorage Class-Specific Control Request
