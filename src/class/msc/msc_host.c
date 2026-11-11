@@ -740,7 +740,7 @@ bool tuh_msc_read_header(uint8_t dev_addr, uint8_t lun, void * buffer, uint32_t 
   scsi_read_header_t const cmd_read_header=
   {
     .cmd_code    = SCSI_CMD_READ_HEADER,
-    .msf         = 1,
+    .msf         = 0,
     .lba         = tu_htonl(lba),
     .alloc_length = tu_htons(8),
   };
@@ -1057,7 +1057,8 @@ bool msch_open(uint8_t rhport, uint8_t dev_addr, tusb_desc_interface_t const *de
       if (p_desc != (uint8_t const*)desc_itf && interface->bAlternateSetting == 0) break;
       if (interface->bInterfaceNumber != desc_itf->bInterfaceNumber ||
           interface->bInterfaceClass != TUSB_CLASS_MSC ||
-          interface->bInterfaceSubClass != MSC_SUBCLASS_SCSI) {
+          (interface->bInterfaceSubClass != MSC_SUBCLASS_SCSI &&
+           interface->bInterfaceSubClass != MSC_SUBCLASS_SFF_MMC)) {
         current_protocol = 0;
         continue;
       }
@@ -1104,10 +1105,12 @@ bool msch_open(uint8_t rhport, uint8_t dev_addr, tusb_desc_interface_t const *de
       tu_edpt_dir(uas.status->bEndpointAddress) == TUSB_DIR_IN &&
       tu_edpt_dir(uas.data_in->bEndpointAddress) == TUSB_DIR_IN &&
       tu_edpt_dir(uas.data_out->bEndpointAddress) == TUSB_DIR_OUT;
-  TU_VERIFY(uas_complete || (bot_candidate && bot_in && bot_out));
+  bool const bot_complete = bot_candidate && bot_in && bot_out;
+  TU_VERIFY(uas_complete || bot_complete);
 
   msch_interface_t* p_msc = get_itf(dev_addr);
-  if (uas_complete) {
+  // Prefer BOT when available; it is more widely interoperable for optical drives.
+  if (!bot_complete) {
     TU_ASSERT(usbh_edpt_open(rhport, dev_addr, uas.command));
     TU_ASSERT(usbh_edpt_open(rhport, dev_addr, uas.status));
     TU_ASSERT(usbh_edpt_open(rhport, dev_addr, uas.data_in));
